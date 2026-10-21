@@ -31,6 +31,16 @@ def mock_resolve_context_length():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _clear_security_text_view_cache():
+    """Keep one test's memoized security views from satisfying the next test."""
+    from skillspector.artifacts import clear_security_text_view_cache
+
+    clear_security_text_view_cache()
+    yield
+    clear_security_text_view_cache()
+
+
 @pytest.fixture
 def safe_skill_dir(tmp_path: Path) -> Path:
     """Create a safe skill directory for testing."""

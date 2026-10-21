@@ -12,10 +12,12 @@ that was inspected.
 from __future__ import annotations
 
 import re
+import threading
 import unicodedata
 from array import array
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections import OrderedDict
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
 from io import StringIO
@@ -251,6 +253,8 @@ _ALLOWED_FORMAT_CHARS = frozenset({"\n", "\r", "\t"})
 # the text, so the answers are memoized rather than recomputed: measured on one
 # real skill, `_has_letter_spacing_run` ran 780 times over 23 distinct texts.
 # The bound keeps a long-lived process from retaining file content indefinitely.
+# ``security_text_views`` reuses the derived views themselves across analyzers;
+# these predicates stay pure and never take a deadline callback.
 _TEXT_PREDICATE_CACHE_SIZE = 64
 
 _IGNORED_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -2340,11 +2344,243 @@ def _has_derived_security_view(text: str) -> bool:
     )
 
 
+# One scan runs every static analyzer over the same windows. Building the
+# derived views is pure, so the first caller stores them and the others reuse
+# the tuple. The key is length plus the process hash, confirmed by equality:
+# a hash collision cannot hand back another text's views. This is the same
+# shape as ``python_literal_spans``, widened because every static analyzer is
+# a consumer rather than three. Sixteen full security windows (the runner's
+# 256_000-character window) is the source-character budget; the entry cap
+# stops a flood of distinct fragments from growing the dict. A text larger
+# than the character budget is not stored. The lock covers the dict only, so
+# a lookup does not wait on another text's build. Callers that do ask for the
+# same text share one in-flight build instead of repeating it on every worker.
+#
+# A deadline callback is not part of the key. A stored result is reused by a
+# deadline-aware caller only after one build has already walked that text
+# while invoking a callback, and the hit still invokes the caller's callback
+# once. A result stored without a callback does not count: the first
+# deadline-aware pass still evaluates the predicates, and an exception is not
+# stored. Returned views are shared and must not be mutated.
+_SECURITY_TEXT_VIEW_WINDOW_CHARS = 256_000
+_SECURITY_TEXT_VIEW_CACHE_WINDOWS = 16
+_SECURITY_TEXT_VIEW_CACHE_MAX_CHARS = (
+    _SECURITY_TEXT_VIEW_CACHE_WINDOWS * _SECURITY_TEXT_VIEW_WINDOW_CHARS
+)
+_SECURITY_TEXT_VIEW_CACHE_MAX_ENTRIES = 256
+
+
+@dataclass(frozen=True)
+class _SecurityTextViewCacheEntry:
+    """One memoized view tuple, retained only while its source text matches."""
+
+    text: str
+    views: tuple[SecurityTextView, ...]
+    deadline_validated: bool
+
+
+@dataclass
+class _SecurityTextViewFlight:
+    """One in-flight build of a single text, shared by the analyzer threads."""
+
+    text: str
+    done: threading.Event = field(default_factory=threading.Event)
+    views: tuple[SecurityTextView, ...] | None = None
+    deadline_validated: bool = False
+
+
+@dataclass
+class _SecurityTextViewCacheState:
+    """Process-local bounded cache. Not part of scan state."""
+
+    entries: OrderedDict[tuple[int, int], _SecurityTextViewCacheEntry] = field(
+        default_factory=OrderedDict
+    )
+    inflight: dict[tuple[int, int], _SecurityTextViewFlight] = field(default_factory=dict)
+    characters: int = 0
+    hits: int = 0
+    misses: int = 0
+
+
+_SECURITY_TEXT_VIEW_CACHE = _SecurityTextViewCacheState()
+_SECURITY_TEXT_VIEW_CACHE_LOCK = threading.Lock()
+
+
+def _security_text_view_cache_key(text: str) -> tuple[int, int]:
+    """Return the length-and-hash key for one view-cache lookup."""
+    return (len(text), hash(text))
+
+
+def _lookup_security_text_views_unlocked(
+    text: str,
+    *,
+    deadline_aware: bool,
+) -> tuple[SecurityTextView, ...] | None:
+    """Return a confirmed cache hit. Caller holds the cache lock."""
+    key = _security_text_view_cache_key(text)
+    entry = _SECURITY_TEXT_VIEW_CACHE.entries.get(key)
+    if entry is None or entry.text != text:
+        return None
+    if deadline_aware and not entry.deadline_validated:
+        return None
+    _SECURITY_TEXT_VIEW_CACHE.entries.move_to_end(key)
+    return entry.views
+
+
+def _claim_security_text_view(
+    text: str,
+    deadline_aware: bool,
+) -> tuple[tuple[SecurityTextView, ...] | None, _SecurityTextViewFlight | None, bool]:
+    """Return a hit, join an in-flight build, or become the builder.
+
+    The third value is true when the caller must build. The flight is ``None``
+    only when another text with the same length and hash is already building:
+    that caller builds without registering, so the two texts cannot share a
+    result.
+    """
+    key = _security_text_view_cache_key(text)
+    with _SECURITY_TEXT_VIEW_CACHE_LOCK:
+        while True:
+            cached = _lookup_security_text_views_unlocked(text, deadline_aware=deadline_aware)
+            if cached is not None:
+                _SECURITY_TEXT_VIEW_CACHE.hits += 1
+                return cached, None, False
+            flight = _SECURITY_TEXT_VIEW_CACHE.inflight.get(key)
+            if flight is not None and not flight.done.is_set():
+                if flight.text == text:
+                    return None, flight, False
+                # Same length and hash, different text: build aside so this
+                # result cannot be published on the other text's flight.
+                _SECURITY_TEXT_VIEW_CACHE.misses += 1
+                return None, None, True
+            if flight is not None and _SECURITY_TEXT_VIEW_CACHE.inflight.get(key) is flight:
+                del _SECURITY_TEXT_VIEW_CACHE.inflight[key]
+                continue
+            flight = _SecurityTextViewFlight(text)
+            _SECURITY_TEXT_VIEW_CACHE.inflight[key] = flight
+            _SECURITY_TEXT_VIEW_CACHE.misses += 1
+            return None, flight, True
+
+
+def _finish_security_text_view_flight(text: str, flight: _SecurityTextViewFlight) -> None:
+    """Drop a finished flight if it is still the one registered for its key."""
+    key = _security_text_view_cache_key(text)
+    with _SECURITY_TEXT_VIEW_CACHE_LOCK:
+        if _SECURITY_TEXT_VIEW_CACHE.inflight.get(key) is flight:
+            del _SECURITY_TEXT_VIEW_CACHE.inflight[key]
+
+
+def _remember_security_text_views(
+    text: str,
+    views: tuple[SecurityTextView, ...],
+    *,
+    deadline_validated: bool,
+) -> None:
+    """Store one successful build, evicting the least-recent entries to fit."""
+    if len(text) > _SECURITY_TEXT_VIEW_CACHE_MAX_CHARS:
+        return
+    key = _security_text_view_cache_key(text)
+    with _SECURITY_TEXT_VIEW_CACHE_LOCK:
+        previous = _SECURITY_TEXT_VIEW_CACHE.entries.pop(key, None)
+        if previous is not None:
+            _SECURITY_TEXT_VIEW_CACHE.characters -= len(previous.text)
+            if previous.text == text and previous.deadline_validated:
+                deadline_validated = True
+        incoming = len(text)
+        while _SECURITY_TEXT_VIEW_CACHE.entries and (
+            len(_SECURITY_TEXT_VIEW_CACHE.entries) >= _SECURITY_TEXT_VIEW_CACHE_MAX_ENTRIES
+            or _SECURITY_TEXT_VIEW_CACHE.characters + incoming > _SECURITY_TEXT_VIEW_CACHE_MAX_CHARS
+        ):
+            _, evicted = _SECURITY_TEXT_VIEW_CACHE.entries.popitem(last=False)
+            _SECURITY_TEXT_VIEW_CACHE.characters -= len(evicted.text)
+        if _SECURITY_TEXT_VIEW_CACHE.characters + incoming > _SECURITY_TEXT_VIEW_CACHE_MAX_CHARS:
+            return
+        _SECURITY_TEXT_VIEW_CACHE.entries[key] = _SecurityTextViewCacheEntry(
+            text,
+            views,
+            deadline_validated,
+        )
+        _SECURITY_TEXT_VIEW_CACHE.characters += incoming
+
+
+def clear_security_text_view_cache() -> None:
+    """Drop retained views and reset hit accounting.
+
+    An in-flight build is left running. If it succeeds, it may store its
+    result after this returns.
+    """
+    with _SECURITY_TEXT_VIEW_CACHE_LOCK:
+        _SECURITY_TEXT_VIEW_CACHE.entries.clear()
+        _SECURITY_TEXT_VIEW_CACHE.characters = 0
+        _SECURITY_TEXT_VIEW_CACHE.hits = 0
+        _SECURITY_TEXT_VIEW_CACHE.misses = 0
+
+
+def security_text_view_cache_info() -> Mapping[str, int]:
+    """Return hit, build, and retention counters for the view cache."""
+    with _SECURITY_TEXT_VIEW_CACHE_LOCK:
+        return {
+            "hits": _SECURITY_TEXT_VIEW_CACHE.hits,
+            "misses": _SECURITY_TEXT_VIEW_CACHE.misses,
+            "entries": len(_SECURITY_TEXT_VIEW_CACHE.entries),
+            "characters": _SECURITY_TEXT_VIEW_CACHE.characters,
+            "max_entries": _SECURITY_TEXT_VIEW_CACHE_MAX_ENTRIES,
+            "max_characters": _SECURITY_TEXT_VIEW_CACHE_MAX_CHARS,
+        }
+
+
 def security_text_views(
     text: str,
     check_runtime: Callable[[], None] | None = None,
 ) -> tuple[SecurityTextView, ...]:
-    """Return distinct raw, normalized, and compact views deterministically."""
+    """Return distinct raw, normalized, and compact views deterministically.
+
+    Repeated calls for the same text reuse one build. A deadline callback is
+    still invoked on a hit, and the first deadline-aware call does not treat a
+    callback-free build as already checked.
+    """
+    deadline_aware = check_runtime is not None
+    while True:
+        cached, flight, is_builder = _claim_security_text_view(text, deadline_aware)
+        if cached is not None:
+            if check_runtime is not None:
+                check_runtime()
+            return cached
+        if not is_builder:
+            if flight is None:
+                raise RuntimeError("security text view cache joined a missing build")
+            flight.done.wait()
+            if (
+                flight.text == text
+                and flight.views is not None
+                and (not deadline_aware or flight.deadline_validated)
+            ):
+                with _SECURITY_TEXT_VIEW_CACHE_LOCK:
+                    _SECURITY_TEXT_VIEW_CACHE.hits += 1
+                if check_runtime is not None:
+                    check_runtime()
+                return flight.views
+            continue
+        if flight is None:
+            views = _security_text_views_uncached(text, check_runtime)
+            _remember_security_text_views(text, views, deadline_validated=deadline_aware)
+            return views
+        try:
+            views = _security_text_views_uncached(text, check_runtime)
+            flight.views = views
+            flight.deadline_validated = deadline_aware
+            _remember_security_text_views(text, views, deadline_validated=deadline_aware)
+            return views
+        finally:
+            flight.done.set()
+            _finish_security_text_view_flight(text, flight)
+
+
+def _security_text_views_uncached(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> tuple[SecurityTextView, ...]:
+    """Build security views for one text without consulting the cross-analyzer cache."""
     if check_runtime is not None:
         check_runtime()
     raw = SecurityTextView("raw", text)
@@ -2353,7 +2589,9 @@ def security_text_views(
         has_obfuscated_instruction = _has_obfuscated_instruction(text)
     else:
         # Deadline-aware scans must keep checking during predicate evaluation.
-        # Do not put callbacks in cache keys or let a hit bypass those checks.
+        # Those predicates are cached without a callback, so a predicate hit
+        # must not skip this walk. The view cache only reuses a result after
+        # one deadline-aware build has already completed.
         has_letter_spacing = next(_letter_spacing_run_spans(text, check_runtime), None) is not None
         has_obfuscated_instruction = (
             next(_obfuscated_instruction_matches(text, check_runtime), None) is not None
