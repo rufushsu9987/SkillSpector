@@ -310,7 +310,57 @@ _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "disregard",
     "forget",
 )
+# Every fixed word the obfuscated-instruction automata can reconstruct.
+# A positive match needs a targeted intra-word gap in at least one of them;
+# the ASCII reject path below is derived from this tuple.
+_OBFUSCATED_INSTRUCTION_WORDS = (
+    *_OBFUSCATED_INSTRUCTION_ACTIONS,
+    "all",
+    "previous",
+    "instruction",
+    "instructions",
+    "safety",
+    "security",
+    "rule",
+    "rules",
+    "constraint",
+    "constraints",
+    "guideline",
+    "guidelines",
+    "your",
+    "system",
+    "restriction",
+    "restrictions",
+    "you",
+    "must",
+    "always",
+)
+_OBFUSCATED_VOCABULARY_LETTERS = frozenset("".join(_OBFUSCATED_INSTRUCTION_WORDS))
 _OBFUSCATED_ACTION_INITIALS = frozenset(action[0] for action in _OBFUSCATED_INSTRUCTION_ACTIONS)
+
+
+def _ascii_obfuscation_translation() -> dict[int, str]:
+    """Fold ASCII to the reject alphabet: lower letters, line breaks, dots."""
+    table: dict[int, str] = {}
+    for codepoint in range(128):
+        character = chr(codepoint)
+        if character.isalpha():
+            table[codepoint] = character.lower()
+        elif character in "\r\n\v\f\x1c\x1d\x1e":
+            table[codepoint] = "\n"
+        else:
+            table[codepoint] = "."
+    return table
+
+
+# A vocabulary match on this fold that is longer than the word contains a
+# targeted gap. Possessive dots keep each search linear.
+_ASCII_OBFUSCATION_TRANSLATION = str.maketrans(_ascii_obfuscation_translation())
+_TRANSLATED_OBFUSCATION_GAP = r"\.*+"
+_TRANSLATED_OBFUSCATED_WORD_PATTERNS = tuple(
+    (word, re.compile(_TRANSLATED_OBFUSCATION_GAP.join(word)))
+    for word in _OBFUSCATED_INSTRUCTION_WORDS
+)
 _ASCII_OBFUSCATED_ACTION_START_PATTERN = re.compile(
     "[" + re.escape("".join(sorted(_OBFUSCATED_ACTION_INITIALS))) + "]",
     re.ASCII | re.IGNORECASE,
@@ -689,7 +739,7 @@ def _concealed_instruction_run_spans(
             offset = run_start + 1
 
 
-def _security_skeleton_piece(character: str) -> str:
+def _skeleton_piece(character: str) -> str:
     """Return the case-folded NFKC/confusable skeleton for one source character."""
     folded = (
         unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
@@ -698,6 +748,29 @@ def _security_skeleton_piece(character: str) -> str:
     # equivalent to ``i``. Mirror that finite equivalence without stripping
     # arbitrary combining marks or accents.
     return "i" if folded == "i\u0307" else folded
+
+
+# ASCII skeletons never change and the confusable map has no ASCII keys, so
+# resolve that range once. The table is the predicate above, not a second copy
+# of the rules.
+_ASCII_SECURITY_SKELETON = tuple(_skeleton_piece(chr(codepoint)) for codepoint in range(128))
+# The reject path treats each ASCII letter as one source character. A future
+# skeleton that expands an ASCII byte has to take the exact automaton instead.
+_ASCII_SKELETON_IS_ONE_CHARACTER = all(len(piece) <= 1 for piece in _ASCII_SECURITY_SKELETON)
+
+
+@lru_cache(maxsize=8192)
+def _non_ascii_security_skeleton_piece(character: str) -> str:
+    """Cache non-ASCII skeletons by character, never by document text."""
+    return _skeleton_piece(character)
+
+
+def _security_skeleton_piece(character: str) -> str:
+    """Return the case-folded NFKC/confusable skeleton for one source character."""
+    codepoint = ord(character)
+    if codepoint < 128:
+        return _ASCII_SECURITY_SKELETON[codepoint]
+    return _non_ascii_security_skeleton_piece(character)
 
 
 def _fold_security_character(character: str) -> str:
@@ -1391,6 +1464,11 @@ def _obfuscated_action_completions(
     )
     if check_runtime is not None:
         check_runtime()
+    # One C scan replaces a Python ``search`` at every candidate. Matches are
+    # still consumed only when the automaton is idle, and each consumption
+    # still checks the runtime once, including the final miss.
+    action_starts = action_start_pattern.finditer(text)
+    next_candidate = next(action_starts, None)
 
     def keep_extremes(
         target: dict[tuple[str, int], tuple[_ObfuscatedIgnoreState, ...]],
@@ -1424,12 +1502,14 @@ def _obfuscated_action_completions(
 
     while cursor < len(text):
         if not states:
-            candidate = action_start_pattern.search(text, cursor)
+            while next_candidate is not None and next_candidate.start() < cursor:
+                next_candidate = next(action_starts, None)
             if check_runtime is not None:
                 check_runtime()
-            if candidate is None:
+            if next_candidate is None:
                 return
-            cursor = candidate.start()
+            cursor = next_candidate.start()
+            next_candidate = next(action_starts, None)
 
         _check_security_runtime(check_runtime, cursor)
         character = text[cursor]
@@ -1522,6 +1602,108 @@ def _obfuscated_action_completions(
         yield from completions
 
 
+_DELETE_ASCII = str.maketrans("", "", "".join(map(chr, range(128))))
+
+
+def _non_ascii_spells_vocabulary_letter(character: str) -> bool:
+    """Return whether *character* can itself supply letters of a fixed security word."""
+    piece = _security_skeleton_piece(character)
+    return (
+        bool(piece)
+        and piece.isascii()
+        and piece.isalpha()
+        and all(letter in _OBFUSCATED_VOCABULARY_LETTERS for letter in piece)
+    )
+
+
+def _ascii_obfuscation_projection(text: str) -> str | None:
+    """Project non-ASCII text onto the ASCII reject alphabet, if that is exact.
+
+    Returns ``None`` when a non-ASCII character can spell a vocabulary letter,
+    because one code point may then stand for several ASCII letters or for
+    either a letter or a gap. Otherwise every non-ASCII character is a line
+    break, a targeted gap, a non-targeted gap, or an interruption.
+    """
+    non_ascii = text.translate(_DELETE_ASCII)
+    if not non_ascii:
+        return text
+    mapping: dict[int, str | None] = {}
+    for character in set(non_ascii):
+        if character in _LOGICAL_LINE_BREAK_CHARACTERS:
+            mapping[ord(character)] = "\n"
+            continue
+        if _non_ascii_spells_vocabulary_letter(character):
+            return None
+        if not character.isalpha() or _is_existing_projection_gap_character(character):
+            # Non-targeted gaps (default ignorables, controls, Hangul fillers)
+            # do not satisfy the reconstruction predicate. Deleting them leaves
+            # the surrounding ASCII spelling unchanged.
+            mapping[ord(character)] = (
+                None if _is_existing_projection_gap_character(character) else "."
+            )
+            continue
+        mapping[ord(character)] = "\n"
+    return text.translate(mapping)
+
+
+def _ascii_has_targeted_obfuscation_candidate(text: str) -> bool:
+    """Return whether an ASCII string spells a vocabulary word with a gap.
+
+    On ASCII each skeleton letter is one source character, and a targeted gap
+    is any other non-line-break character. After the fold above, a pattern
+    match longer than the word contains a ``.``. Contiguous words
+    (``ignore previous instructions``) do not. The translation is one-to-one,
+    so match length is the source length.
+    """
+    folded = text.translate(_ASCII_OBFUSCATION_TRANSLATION)
+    for word, pattern in _TRANSLATED_OBFUSCATED_WORD_PATTERNS:
+        start = 0
+        word_length = len(word)
+        while True:
+            match = pattern.search(folded, start)
+            if match is None:
+                break
+            if match.end() - match.start() > word_length:
+                return True
+            start = match.end()
+    return False
+
+
+def _has_targeted_obfuscation_candidate(text: str) -> bool:
+    """Return whether the exact automaton can yield a positive match."""
+    if not _ASCII_SKELETON_IS_ONE_CHARACTER:
+        return True
+    if not text.isascii():
+        projected = _ascii_obfuscation_projection(text)
+        if projected is None:
+            return True
+        text = projected
+    return _ascii_has_targeted_obfuscation_candidate(text)
+
+
+def _observe_obfuscated_fast_reject(
+    text: str,
+    check_runtime: Callable[[], None] | None,
+) -> None:
+    """Keep a candidate-free input cancellable.
+
+    The exact scan checks the runtime once before it searches and once for
+    every search, and at each visited offset on a 4096-character boundary.
+    A reject does not visit those offsets. Checking once up front, once per
+    4096 characters of input, and once after the scan preserves a bounded
+    cancellation point without replaying per-candidate work that did not run.
+    """
+    if check_runtime is None:
+        return
+    check_runtime()
+    offset = 4096
+    length = len(text)
+    while offset < length:
+        check_runtime()
+        offset += 4096
+    check_runtime()
+
+
 def _obfuscated_instruction_matches(
     text: str,
     check_runtime: Callable[[], None] | None = None,
@@ -1532,7 +1714,21 @@ def _obfuscated_instruction_matches(
     opaque identifiers remain unchanged unless the reconstructed phrase is an
     existing P1 instruction-override form. Each source character is visited a
     constant number of times and only bounded gap ranges are retained.
+
+    A positive match always contains a targeted gap inside one fixed word.
+    Texts that cannot, including ordinary ASCII prose, skip the automaton.
     """
+    if not _has_targeted_obfuscation_candidate(text):
+        _observe_obfuscated_fast_reject(text, check_runtime)
+        return
+    yield from _obfuscated_instruction_matches_exact(text, check_runtime)
+
+
+def _obfuscated_instruction_matches_exact(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[_ObfuscatedInstructionMatch]:
+    """Run the obfuscated-instruction automaton with no reject short-circuit."""
     accepted_until = 0
     for (
         action,
